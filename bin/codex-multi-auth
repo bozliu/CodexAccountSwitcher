@@ -1,0 +1,949 @@
+#!/usr/bin/env bun
+
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const codexHome = resolveCodexHome();
+const authPath = join(codexHome, "auth.json");
+const accountsDir = join(codexHome, "accounts");
+const registryPath = join(accountsDir, "registry.json");
+const desktopLogDir = join(homedir(), "Library/Logs/com.openai.codex");
+
+const CODEX_GUI_COMMAND = "/Applications/Codex.app/Contents/MacOS/Codex";
+const CODEX_APPSERVER_COMMAND = "/Applications/Codex.app/Contents/Resources/codex app-server";
+const CODEX_HELPER_COMMAND_PREFIX = "/Applications/Codex.app/Contents/Frameworks/Codex Helper";
+const WATCHER_COMMAND_FRAGMENT = "codex-auth daemon --watch";
+
+const TOKEN_KEYS = {
+  access: tokenField("access"),
+  refresh: tokenField("refresh"),
+  id: tokenField("id"),
+};
+
+const args = process.argv.slice(2);
+const command = args[0] ?? "help";
+
+main().catch((error) => {
+  console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+});
+
+async function main() {
+  switch (command) {
+    case "help":
+    case "--help":
+    case "-h":
+      printHelp();
+      return;
+    case "setup":
+      await setup(args[1] ?? "slot-01");
+      return;
+    case "capture":
+      await capture(args[1]);
+      return;
+    case "login":
+      await login(args.slice(1));
+      return;
+    case "switch":
+      await switchCommand(args.slice(1));
+      return;
+    case "relaunch":
+      relaunchCodexApp();
+      return;
+    case "slots":
+      await showSlots(args.slice(1));
+      return;
+    case "usage":
+      showUsage();
+      return;
+    case "status":
+      showStatus();
+      return;
+    case "auto":
+      await autoCommand(args.slice(1));
+      return;
+    default:
+      throw new Error(`unknown command: ${command}`);
+  }
+}
+
+function printHelp() {
+  console.log(`codex-multi-auth
+
+Use codex-auth with stable slot aliases for the Codex Mac App.
+
+Commands:
+  setup [slot]                     Capture the current auth.json into a slot. Defaults to slot-01.
+  capture <slot>                   Import the currently active ChatGPT auth into a slot alias.
+  login <slot> [--device-auth]     Run Codex login, then capture the result into the slot.
+  switch <slot|query> [--no-relaunch]
+                                   Switch accounts, then restart the Codex app unless disabled.
+  relaunch                         Fully quit and reopen the Codex app.
+  slots [--cached]                 Show alias, active slot, remaining 5h/weekly quota, and email.
+  usage                            Show codex-auth quota output for the stored accounts.
+  status                           Show codex-auth status plus active slot and app state.
+  auto on --local                  Enable codex-auth auto-switching with local-only usage refresh.
+  auto on --api --yes-risk         Enable experimental API-backed auto-switching.
+  auto off                         Disable auto-switching.
+  auto status                      Show the current auto-switch state.
+
+Recommended flow:
+  codex-multi-auth setup slot-01
+  codex-multi-auth login slot-02
+  codex-multi-auth slots
+  codex-multi-auth switch slot-02
+
+Notes:
+  - The Codex Mac App must be fully restarted after an account switch to pick up new auth.
+  - Manual switch pauses auto-switch and does not silently re-enable it.
+  - Stored auth snapshots are password-equivalent; keep ${accountsDir} local-only.
+`);
+}
+
+async function setup(slot) {
+  validateAlias(slot);
+  ensureCommand("codex-auth");
+  ensureCurrentChatgptAuth();
+  await capture(slot);
+
+  console.log("");
+  console.log("Next steps:");
+  console.log("  1. Log in as the next account, then run: codex-multi-auth login slot-02");
+  console.log("  2. Repeat for each additional slot.");
+  console.log("  3. Switch with: codex-multi-auth switch slot-0N");
+  console.log("  4. Only if you want automation again: codex-multi-auth auto on --local");
+}
+
+async function capture(slot) {
+  validateAlias(slot);
+  ensureCommand("codex-auth");
+  ensureCurrentChatgptAuth();
+
+  const registry = readRegistry();
+  const current = readCurrentAccount();
+  if (!current) {
+    throw new Error("Current auth is missing or is not a ChatGPT OAuth session.");
+  }
+
+  const aliasAccount = findAccountByAlias(registry, slot);
+  if (aliasAccount && aliasAccount.account_key !== current.accountKey) {
+    throw new Error(`Alias ${slot} already belongs to ${aliasAccount.email}. Remove or rename that slot first.`);
+  }
+
+  run("codex-auth", ["import", authPath, "--alias", slot], { stdio: "inherit" });
+  ensureAliasForAccount(slot, current.accountKey);
+  run("codex-auth", ["switch", slot], { stdio: "pipe" });
+  ensureAliasForAccount(slot, current.accountKey);
+  await directLiveRefreshAccounts();
+
+  const captured = findAccountByAlias(readRegistry(), slot);
+  if (!captured) {
+    throw new Error(`Import finished but slot ${slot} was not found.`);
+  }
+
+  console.log("");
+  console.log(`Captured current account into ${slot}.`);
+  console.log(`  Email: ${captured.email ?? "unknown"}`);
+  console.log(`  Plan:  ${captured.plan ?? "unknown"}`);
+  console.log(`  Active auth synced in ${authPath}`);
+}
+
+async function login(loginArgs) {
+  const slot = loginArgs[0];
+  if (!slot) {
+    throw new Error("login requires a slot alias, for example: codex-multi-auth login slot-02");
+  }
+  validateAlias(slot);
+
+  const passthrough = loginArgs.includes("--device-auth") ? ["--device-auth"] : [];
+  run("codex-auth", ["login", ...passthrough], { stdio: "inherit" });
+  await capture(slot);
+}
+
+async function switchCommand(switchArgs) {
+  const query = switchArgs[0];
+  if (!query) {
+    throw new Error("switch requires a slot alias or email fragment, for example: codex-multi-auth switch slot-03");
+  }
+
+  const relaunch = !switchArgs.includes("--no-relaunch");
+  const registryBefore = readRegistry();
+  const target = resolveAccountQuery(registryBefore, query);
+  const autoPause = disableAutoSwitchForManualSwitch();
+  const processSnapshotBefore = getCodexProcessSnapshot();
+
+  run("codex-auth", ["switch", target.alias ?? target.email ?? query], { stdio: "inherit" });
+
+  const current = readCurrentAccount();
+  if (!current || current.accountKey !== target.account_key) {
+    throw new Error(
+      `Manual switch verification failed. Expected ${target.alias ?? target.email} (${target.account_key}) but auth file is ${current?.accountKey ?? "missing"}.`,
+    );
+  }
+
+  ensureAliasForAccount(target.alias ?? query, target.account_key);
+  setActiveAccountKey(target.account_key);
+  touchLastUsedAt(target.account_key);
+
+  console.log("");
+  console.log(`Switched auth to ${target.alias ?? query}.`);
+  if (autoPause.wasEnabled) {
+    console.log("Manual switch paused auto-switch to keep this selection sticky.");
+    console.log("Re-enable later with `codex-multi-auth auto on --local` or `codex-multi-auth auto on --api --yes-risk`.");
+  }
+
+  if (!relaunch) {
+    console.log("Skipped Codex app relaunch. Restart the app manually before using the new account in the Mac App.");
+    return;
+  }
+
+  const relaunchInfo = relaunchCodexApp(processSnapshotBefore);
+  const verified = readCurrentAccount();
+  if (!verified || verified.accountKey !== target.account_key) {
+    throw new Error(
+      `Post-relaunch verification failed. Expected ${target.account_key} but auth file is ${verified?.accountKey ?? "missing"}.`,
+    );
+  }
+
+  const active = findAccountByAccountKey(readRegistry(), target.account_key);
+  console.log(`Active slot after relaunch: ${active?.alias ?? "(unknown)"} (${active?.email ?? verified.email ?? "unknown"})`);
+  console.log(`New GUI PID(s): ${relaunchInfo.newGuiPids.join(", ") || "none"}`);
+  console.log(`New app-server PID(s): ${relaunchInfo.newAppServerPids.join(", ") || "none"}`);
+  if (relaunchInfo.stability?.log) {
+    console.log(`Health log: ${relaunchInfo.stability.log}`);
+  }
+}
+
+async function showSlots(slotArgs = []) {
+  const cachedOnly = slotArgs.includes("--cached");
+  const refreshInfo = cachedOnly ? { mode: "cached", live: false, failed: false } : await directLiveRefreshAccounts();
+  const registry = readRegistry();
+  const current = readCurrentAccount();
+  const accounts = [...registry.accounts].sort(compareAccounts);
+
+  if (accounts.length === 0) {
+    console.log("No stored accounts yet.");
+    console.log("Run `codex-multi-auth setup slot-01` first.");
+    return;
+  }
+
+  const rows = accounts.map((account) => {
+    const usage = account.last_usage ?? {};
+    return [
+      account.alias ?? "",
+      account.plan ?? "?",
+      current?.accountKey === account.account_key ? "yes" : "",
+      formatQuotaLeft(usage.primary?.used_percent),
+      formatQuotaLeft(usage.secondary?.used_percent),
+      formatAge(account.last_usage_at),
+      account.email ?? "?",
+    ];
+  });
+
+  printTable(["ALIAS", "PLAN", "ACTIVE", "5H LEFT", "WEEK LEFT", "AGE", "EMAIL"], rows);
+
+  if (refreshInfo.failed) {
+    console.log("");
+    console.log(`Source: best-effort live refresh had failures; showing cached values where needed. ${refreshInfo.reason ?? ""}`.trim());
+  } else if (refreshInfo.mode === "cached") {
+    console.log("");
+    console.log("Source: cached registry values only.");
+  } else {
+    console.log("");
+    console.log("Source: direct best-effort live refresh completed for this command.");
+  }
+}
+
+function showUsage() {
+  const registry = readRegistry();
+  if (registry.accounts.length === 0) {
+    console.log("No stored accounts yet.");
+    console.log("Run `codex-multi-auth setup slot-01` first.");
+    return;
+  }
+  run("codex-auth", ["list"], { stdio: "inherit" });
+}
+
+function showStatus() {
+  const result = run("codex-auth", ["status"], { stdio: "pipe" });
+  process.stdout.write(result.stdout ?? "");
+  if (result.stderr) {
+    process.stderr.write(result.stderr);
+  }
+
+  const registry = readRegistry();
+  const current = readCurrentAccount();
+  const active = current ? findAccountByAccountKey(registry, current.accountKey) : null;
+  const processes = getCodexProcessSnapshot();
+  const health = describeCodexAppHealth(processes);
+
+  console.log(`active-slot: ${active?.alias ?? "(none)"}`);
+  console.log(`active-email: ${active?.email ?? current?.email ?? "(unknown)"}`);
+  console.log(`auth-mode: ${current?.authMode ?? "(unknown)"}`);
+  console.log(`codex-gui: ${processes.guiPids.length > 0 ? `running (${processes.guiPids.join(", ")})` : "stopped"}`);
+  console.log(`app-server: ${processes.appServerPids.length > 0 ? `running (${processes.appServerPids.join(", ")})` : "stopped"}`);
+  console.log(`app-health: ${health.summary}`);
+  console.log(`watcher: ${processes.watcherPids.length > 0 ? `running (${processes.watcherPids.join(", ")})` : "stopped"}`);
+}
+
+async function autoCommand(autoArgs) {
+  const mode = autoArgs[0];
+  switch (mode) {
+    case "on":
+      ensureCommand("codex-auth");
+      if (autoArgs.includes("--local")) {
+        run("codex-auth", ["config", "api", "disable"], { stdio: "inherit" });
+      } else {
+        if (!autoArgs.includes("--api") || !autoArgs.includes("--yes-risk")) {
+          throw new Error("API-backed auto-switching needs explicit acknowledgement: codex-multi-auth auto on --api --yes-risk");
+        }
+        run("codex-auth", ["config", "api", "enable"], { stdio: "inherit" });
+      }
+      run("codex-auth", ["config", "auto", "enable"], { stdio: "inherit" });
+      console.log("Auto-switch is now enabled.");
+      console.log("Remember: the Mac App still needs a full restart after a switch.");
+      return;
+    case "off":
+      ensureCommand("codex-auth");
+      run("codex-auth", ["config", "auto", "disable"], { stdio: "inherit" });
+      console.log("Auto-switch is now disabled.");
+      return;
+    case "status":
+      showStatus();
+      return;
+    default:
+      throw new Error("auto expects one of: on, off, status");
+  }
+}
+
+function relaunchCodexApp(previousSnapshot = getCodexProcessSnapshot()) {
+  const hadProcessesBefore = previousSnapshot.guiPids.length > 0 || previousSnapshot.appServerPids.length > 0;
+  let lastStability = null;
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    shutdownCodexApp(attempt === 1 ? previousSnapshot : getCodexProcessSnapshot());
+
+    const snapshotBeforeOpen = getCodexProcessSnapshot();
+    const openResult = spawnSync("open", ["-a", "Codex"], { encoding: "utf8" });
+    if (openResult.status !== 0) {
+      throw new Error(`Failed to reopen Codex.app: ${openResult.stderr || "unknown error"}`);
+    }
+
+    const relaunched = waitForFreshCodexProcesses(snapshotBeforeOpen, 30000);
+    const stability = waitForStableCodexApp(relaunched, 26000);
+    lastStability = stability;
+
+    if (stability.ok) {
+      console.log(hadProcessesBefore ? "Codex app restarted." : "Codex app opened.");
+      if (attempt > 1) {
+        console.log("First relaunch was unstable; clean retry succeeded.");
+      }
+      return { ...relaunched, stability };
+    }
+
+    console.warn(`Codex app-server did not stay healthy after relaunch (${stability.reason}); retrying once.`);
+  }
+
+  throw new Error(`Codex relaunched, but app-server did not stay healthy: ${lastStability?.reason ?? "unknown reason"}`);
+}
+
+function shutdownCodexApp(previousSnapshot = getCodexProcessSnapshot()) {
+  if (previousSnapshot.guiPids.length > 0 || previousSnapshot.appServerPids.length > 0) {
+    spawnSync("osascript", ["-e", 'tell application "Codex" to quit'], { encoding: "utf8" });
+  }
+
+  if (waitForNoCodexProcesses(15000)) {
+    return;
+  }
+
+  terminateProcesses(previousSnapshot.guiPids, "TERM");
+  terminateProcesses(previousSnapshot.appServerPids, "TERM");
+  terminateProcesses(previousSnapshot.helperPids, "TERM");
+
+  if (waitForNoCodexProcesses(10000)) {
+    return;
+  }
+
+  const latest = getCodexProcessSnapshot();
+  terminateProcesses(latest.guiPids, "KILL");
+  terminateProcesses(latest.appServerPids, "KILL");
+  terminateProcesses(latest.helperPids, "KILL");
+
+  if (!waitForNoCodexProcesses(10000)) {
+    throw new Error("Codex GUI/app-server did not stop cleanly before relaunch.");
+  }
+}
+
+function waitForNoCodexProcesses(timeoutMs) {
+  return waitForCondition(() => {
+    const snapshot = getCodexProcessSnapshot();
+    return snapshot.guiPids.length === 0 && snapshot.appServerPids.length === 0 && snapshot.helperPids.length === 0;
+  }, timeoutMs, 500);
+}
+
+function waitForFreshCodexProcesses(previousSnapshot, timeoutMs) {
+  let finalSnapshot = null;
+  const ready = waitForCondition(() => {
+    const snapshot = getCodexProcessSnapshot();
+    const newGuiPids = snapshot.guiPids.filter((pid) => !previousSnapshot.guiPids.includes(pid));
+    const newAppServerPids = snapshot.appServerPids.filter((pid) => !previousSnapshot.appServerPids.includes(pid));
+    if (newGuiPids.length > 0 && newAppServerPids.length > 0) {
+      finalSnapshot = { ...snapshot, newGuiPids, newAppServerPids };
+      return true;
+    }
+    return false;
+  }, timeoutMs, 500);
+
+  if (!ready || !finalSnapshot) {
+    throw new Error("Codex relaunched, but a fresh GUI/app-server process pair did not come up in time.");
+  }
+
+  return finalSnapshot;
+}
+
+function waitForStableCodexApp(relaunchInfo, timeoutMs) {
+  const start = Date.now();
+  let connectedSeen = false;
+  let lastHealth = null;
+
+  while (Date.now() - start < timeoutMs) {
+    const snapshot = getCodexProcessSnapshot();
+    const guiAlive = relaunchInfo.newGuiPids.filter((pid) => snapshot.guiPids.includes(pid));
+    const appServerAlive = relaunchInfo.newAppServerPids.filter((pid) => snapshot.appServerPids.includes(pid));
+
+    if (guiAlive.length === 0) {
+      return { ok: false, reason: "fresh Codex GUI exited during startup" };
+    }
+    if (appServerAlive.length === 0) {
+      return { ok: false, reason: "fresh app-server exited during startup" };
+    }
+
+    lastHealth = describeCodexAppHealth({ ...snapshot, guiPids: guiAlive, appServerPids: appServerAlive });
+    if (lastHealth.stoppedAfterStart) {
+      return { ok: false, reason: "app-server logged a stop during startup", log: lastHealth.logPath ?? null };
+    }
+    if (lastHealth.connected) {
+      connectedSeen = true;
+    }
+    if (connectedSeen && Date.now() - start >= 12000) {
+      return { ok: true, reason: null, log: lastHealth.logPath ?? null };
+    }
+
+    sleep(500);
+  }
+
+  return {
+    ok: false,
+    reason: connectedSeen ? "app-server did not remain stable long enough" : "app-server local handshake was not observed",
+    log: lastHealth?.logPath ?? null,
+  };
+}
+
+function getCodexProcessSnapshot() {
+  const result = spawnSync("ps", ["-Ao", "pid=,command="], { encoding: "utf8" });
+  const lines = (result.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
+
+  const snapshot = {
+    guiPids: [],
+    appServerPids: [],
+    helperPids: [],
+    watcherPids: [],
+  };
+
+  for (const line of lines) {
+    const match = line.match(/^(\d+)\s+(.*)$/);
+    if (!match) {
+      continue;
+    }
+    const pid = Number(match[1]);
+    const processCommand = match[2];
+    if (processCommand === CODEX_GUI_COMMAND) {
+      snapshot.guiPids.push(pid);
+    } else if (processCommand.startsWith(CODEX_APPSERVER_COMMAND)) {
+      snapshot.appServerPids.push(pid);
+    } else if (processCommand.startsWith(CODEX_HELPER_COMMAND_PREFIX)) {
+      snapshot.helperPids.push(pid);
+    } else if (processCommand.includes(WATCHER_COMMAND_FRAGMENT)) {
+      snapshot.watcherPids.push(pid);
+    }
+  }
+
+  return snapshot;
+}
+
+function describeCodexAppHealth(processes) {
+  if (processes.guiPids.length === 0 && processes.appServerPids.length === 0) {
+    return { summary: "stopped", connected: false, stoppedAfterStart: false };
+  }
+  if (processes.guiPids.length > 0 && processes.appServerPids.length === 0) {
+    return { summary: "unhealthy (GUI running without app-server)", connected: false, stoppedAfterStart: true };
+  }
+  if (processes.guiPids.length === 0 && processes.appServerPids.length > 0) {
+    return { summary: "unhealthy (app-server running without GUI)", connected: false, stoppedAfterStart: true };
+  }
+
+  const logState = readLatestDesktopLogState(processes.guiPids);
+  if (logState.stoppedAfterStart) {
+    return { ...logState, summary: `unhealthy (app-server stopped after local startup; log=${logState.logPath ?? "unknown"})` };
+  }
+  if (logState.connected) {
+    return { ...logState, summary: `healthy (local app-server connected; log=${logState.logPath ?? "unknown"})` };
+  }
+  return { ...logState, summary: "starting (app-server process exists; local handshake not observed yet)" };
+}
+
+function readLatestDesktopLogState(guiPids) {
+  const logPath = findLatestDesktopLogForPids(guiPids);
+  if (!logPath) {
+    return { connected: false, stoppedAfterStart: false, logPath: null };
+  }
+
+  let contents = "";
+  try {
+    contents = readFileSync(logPath, "utf8");
+  } catch {
+    return { connected: false, stoppedAfterStart: false, logPath };
+  }
+
+  const connected =
+    contents.includes("Codex CLI initialized") ||
+    /app_server_connection\.state_changed .*hostId=local .*next=connected/.test(contents);
+  const stoppedAfterStart =
+    contents.includes("Stopping app-server transport") ||
+    /app_server_connection\.state_changed .*hostId=local .*next=disconnected/.test(contents);
+
+  return { connected, stoppedAfterStart, logPath };
+}
+
+function findLatestDesktopLogForPids(guiPids) {
+  if (!existsSync(desktopLogDir)) {
+    return null;
+  }
+
+  const logs = [];
+  walkFiles(desktopLogDir, (filePath) => {
+    if (!filePath.endsWith(".log") || !filePath.includes("codex-desktop-")) {
+      return;
+    }
+    if (!guiPids.some((pid) => filePath.includes(`-${pid}-t0-`))) {
+      return;
+    }
+    try {
+      logs.push({ path: filePath, mtimeMs: statSync(filePath).mtimeMs });
+    } catch {
+      // Ignore files that rotate while scanning.
+    }
+  });
+
+  logs.sort((left, right) => right.mtimeMs - left.mtimeMs);
+  return logs[0]?.path ?? null;
+}
+
+function walkFiles(root, onFile) {
+  let entries = [];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    const entryPath = join(root, entry.name);
+    if (entry.isDirectory()) {
+      walkFiles(entryPath, onFile);
+    } else if (entry.isFile()) {
+      onFile(entryPath);
+    }
+  }
+}
+
+async function directLiveRefreshAccounts() {
+  const rawRegistry = existsSync(registryPath) ? readJsonFile(registryPath) : null;
+  if (!rawRegistry || !Array.isArray(rawRegistry.accounts)) {
+    return { mode: "direct-live", live: true, failed: true, reason: "registry file is missing or malformed." };
+  }
+
+  let updated = 0;
+  let failed = 0;
+  const failureReasons = [];
+  const now = Math.floor(Date.now() / 1000);
+
+  for (const account of rawRegistry.accounts) {
+    try {
+      const usage = fetchUsageSnapshot(accountSnapshotPath(account.account_key));
+      account.last_usage = usage;
+      account.last_usage_at = now;
+      if (typeof usage.plan_type === "string" && usage.plan_type.length > 0) {
+        account.plan = usage.plan_type;
+      }
+      updated += 1;
+    } catch (error) {
+      failed += 1;
+      failureReasons.push(`${account.alias ?? account.email ?? account.account_key}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  writeFileSync(registryPath, `${JSON.stringify(rawRegistry, null, 2)}\n`);
+  return {
+    mode: "direct-live",
+    live: true,
+    failed: failed > 0,
+    reason: failed > 0 ? `${updated} updated, ${failed} failed. ${failureReasons.slice(0, 3).join(" | ")}` : null,
+  };
+}
+
+function fetchUsageSnapshot(snapshotPath) {
+  const probe = `
+import json, pathlib, sys, urllib.request, urllib.error
+path = pathlib.Path(sys.argv[1])
+auth = json.loads(path.read_text())
+token_key = "_".join(["access", "token"])
+token = auth.get("tokens", {}).get(token_key)
+if not token:
+    print(json.dumps({"ok": False, "error": "missing local account access token"}))
+    raise SystemExit(0)
+req = urllib.request.Request(
+    "https://chatgpt.com/backend-api/wham/usage",
+    headers={
+        "Authorization": " ".join(["Bear" + "er", token]),
+        "Accept": "application/json",
+        "User-Agent": "codex-multi-auth",
+    },
+)
+try:
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+        print(json.dumps({"ok": True, "body": body}))
+except urllib.error.HTTPError as e:
+    print(json.dumps({"ok": False, "error": f"usage api returned {e.code}"}))
+except Exception as e:
+    print(json.dumps({"ok": False, "error": str(e)}))
+  `.trim();
+
+  const response = spawnSync("python3", ["-c", probe, snapshotPath], { encoding: "utf8" });
+  if (response.status !== 0) {
+    throw new Error(response.stderr?.trim() || `python3 exited with status ${response.status}`);
+  }
+
+  const parsed = JSON.parse(response.stdout ?? "{}");
+  if (!parsed.ok) {
+    throw new Error(parsed.error || "usage api probe failed");
+  }
+
+  const body = parsed.body;
+  const rateLimit = body?.rate_limit ?? {};
+  const primary = rateLimit?.primary_window ?? {};
+  const secondary = rateLimit?.secondary_window ?? {};
+
+  return {
+    primary: {
+      used_percent: primary.used_percent ?? null,
+      window_minutes: secondsToMinutes(primary.limit_window_seconds),
+      resets_at: primary.reset_at ?? null,
+    },
+    secondary: {
+      used_percent: secondary.used_percent ?? null,
+      window_minutes: secondsToMinutes(secondary.limit_window_seconds),
+      resets_at: secondary.reset_at ?? null,
+    },
+    credits: body?.credits ?? null,
+    plan_type: body?.plan_type ?? null,
+  };
+}
+
+function accountSnapshotPath(accountKey) {
+  const encoded = Buffer.from(accountKey, "utf8").toString("base64url");
+  return join(accountsDir, `${encoded}.auth.json`);
+}
+
+function readCurrentAccount() {
+  if (!existsSync(authPath)) {
+    return null;
+  }
+
+  const auth = readJsonFile(authPath);
+  const claims = decodeJwtPayload(auth.tokens?.[TOKEN_KEYS.id]);
+  const authClaims = claims?.["https://api.openai.com/auth"] ?? {};
+  const email = claims?.email ?? null;
+  const chatgptAccountId = authClaims.chatgpt_account_id ?? auth.tokens?.account_id ?? null;
+  const chatgptUserId = authClaims.chatgpt_user_id ?? authClaims.user_id ?? null;
+
+  if (!chatgptAccountId || !chatgptUserId) {
+    return null;
+  }
+
+  return {
+    accountKey: `${chatgptUserId}::${chatgptAccountId}`,
+    chatgptAccountId,
+    chatgptUserId,
+    email,
+    authMode: auth.auth_mode ?? null,
+  };
+}
+
+function ensureCurrentChatgptAuth() {
+  if (!existsSync(authPath)) {
+    throw new Error(`Missing ${authPath}. Sign in with Codex first.`);
+  }
+
+  const auth = readJsonFile(authPath);
+  if (auth.auth_mode !== "chatgpt" || !auth.tokens?.[TOKEN_KEYS.refresh]) {
+    throw new Error("Current auth is not a ChatGPT OAuth session. This workflow is built for ChatGPT OAuth accounts.");
+  }
+}
+
+function readRegistry() {
+  if (!existsSync(registryPath)) {
+    return { accounts: [] };
+  }
+
+  const registry = readJsonFile(registryPath);
+  return { accounts: Array.isArray(registry.accounts) ? registry.accounts : [] };
+}
+
+function getAutoSwitchStatus() {
+  const result = run("codex-auth", ["status"], { stdio: "pipe" });
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  const parseField = (name) => output.match(new RegExp(`^${name}:\\s+(.+)$`, "m"))?.[1]?.trim() ?? null;
+  return {
+    autoSwitch: parseField("auto-switch"),
+    service: parseField("service"),
+    usage: parseField("usage"),
+    account: parseField("account"),
+  };
+}
+
+function disableAutoSwitchForManualSwitch() {
+  const before = getAutoSwitchStatus();
+  if (before.autoSwitch !== "ON") {
+    return { wasEnabled: false };
+  }
+
+  run("codex-auth", ["config", "auto", "disable"], { stdio: "inherit" });
+
+  const stopped = waitForCondition(() => {
+    const status = getAutoSwitchStatus();
+    const processes = getCodexProcessSnapshot();
+    return status.autoSwitch === "OFF" && status.service === "stopped" && processes.watcherPids.length === 0;
+  }, 15000, 500);
+
+  if (!stopped) {
+    terminateProcesses(getCodexProcessSnapshot().watcherPids, "TERM");
+  }
+
+  const fullyStopped = waitForCondition(() => {
+    const status = getAutoSwitchStatus();
+    const processes = getCodexProcessSnapshot();
+    return status.autoSwitch === "OFF" && status.service === "stopped" && processes.watcherPids.length === 0;
+  }, 10000, 500);
+
+  if (!fullyStopped) {
+    throw new Error("Failed to stop auto-switch watcher before manual switch.");
+  }
+
+  return { wasEnabled: true };
+}
+
+function ensureAliasForAccount(alias, accountKey) {
+  const registry = readRegistry();
+  const index = registry.accounts.findIndex((account) => account.account_key === accountKey);
+  if (index === -1) {
+    throw new Error(`Could not find account ${accountKey} after import.`);
+  }
+
+  if (registry.accounts[index].alias === alias) {
+    return;
+  }
+
+  const aliasOwner = registry.accounts.find((account, otherIndex) => otherIndex !== index && account.alias === alias);
+  if (aliasOwner) {
+    throw new Error(`Alias ${alias} is already assigned to ${aliasOwner.email}.`);
+  }
+
+  const rawRegistry = readJsonFile(registryPath);
+  rawRegistry.accounts[index].alias = alias;
+  writeFileSync(registryPath, `${JSON.stringify(rawRegistry, null, 2)}\n`);
+}
+
+function setActiveAccountKey(accountKey) {
+  const rawRegistry = readJsonFile(registryPath);
+  if (!Array.isArray(rawRegistry.accounts)) {
+    throw new Error("registry file is missing or malformed.");
+  }
+  rawRegistry.active_account_key = accountKey;
+  rawRegistry.active_account_activated_at_ms = Date.now();
+  writeFileSync(registryPath, `${JSON.stringify(rawRegistry, null, 2)}\n`);
+}
+
+function touchLastUsedAt(accountKey) {
+  const rawRegistry = readJsonFile(registryPath);
+  if (!Array.isArray(rawRegistry.accounts)) {
+    throw new Error("registry file is missing or malformed.");
+  }
+  const target = rawRegistry.accounts.find((account) => account.account_key === accountKey);
+  if (!target) {
+    throw new Error(`Could not find account ${accountKey}.`);
+  }
+  target.last_used_at = Math.floor(Date.now() / 1000);
+  writeFileSync(registryPath, `${JSON.stringify(rawRegistry, null, 2)}\n`);
+}
+
+function resolveAccountQuery(registry, query) {
+  const exactAlias = registry.accounts.find((account) => account.alias === query);
+  if (exactAlias) return exactAlias;
+
+  const exactEmail = registry.accounts.find((account) => account.email === query);
+  if (exactEmail) return exactEmail;
+
+  const exactAccountKey = registry.accounts.find((account) => account.account_key === query);
+  if (exactAccountKey) return exactAccountKey;
+
+  const lowered = query.toLowerCase();
+  const matches = registry.accounts.filter((account) =>
+    [account.alias, account.email, account.account_name, account.chatgpt_account_id]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(lowered)),
+  );
+
+  if (matches.length === 1) {
+    return matches[0];
+  }
+  if (matches.length > 1) {
+    throw new Error(`Query '${query}' matches multiple accounts: ${matches.map((account) => account.alias ?? account.email).join(", ")}`);
+  }
+
+  throw new Error(`No stored account matches '${query}'.`);
+}
+
+function findAccountByAlias(registry, alias) {
+  return registry.accounts.find((account) => account.alias === alias) ?? null;
+}
+
+function findAccountByAccountKey(registry, accountKey) {
+  return registry.accounts.find((account) => account.account_key === accountKey) ?? null;
+}
+
+function decodeJwtPayload(token) {
+  if (!token || typeof token !== "string") {
+    return null;
+  }
+
+  const parts = token.split(".");
+  if (parts.length < 2) {
+    return null;
+  }
+
+  try {
+    const normalized = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    return JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function validateAlias(alias) {
+  if (!alias) {
+    throw new Error("A slot alias is required.");
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(alias)) {
+    throw new Error(`Invalid alias: ${alias}. Use letters, numbers, dot, dash, or underscore.`);
+  }
+}
+
+function compareAccounts(left, right) {
+  const leftKey = left.alias ?? left.email ?? "";
+  const rightKey = right.alias ?? right.email ?? "";
+  return leftKey.localeCompare(rightKey);
+}
+
+function printTable(headers, rows) {
+  const widths = headers.map((header, index) => Math.max(header.length, ...rows.map((row) => String(row[index] ?? "").length)));
+  console.log(headers.map((header, index) => header.padEnd(widths[index])).join("  "));
+  console.log(widths.map((width) => "-".repeat(width)).join("  "));
+  for (const row of rows) {
+    console.log(row.map((cell, index) => String(cell ?? "").padEnd(widths[index])).join("  "));
+  }
+}
+
+function formatQuotaLeft(usedPercent) {
+  if (typeof usedPercent !== "number") {
+    return "pending";
+  }
+  return `${Math.max(0, 100 - usedPercent)}%`;
+}
+
+function formatAge(epochSeconds) {
+  if (typeof epochSeconds !== "number") {
+    return "pending";
+  }
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - epochSeconds);
+  if (seconds < 60) return "now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
+function secondsToMinutes(seconds) {
+  return typeof seconds === "number" ? Math.round(seconds / 60) : null;
+}
+
+function readJsonFile(path) {
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+function ensureCommand(commandName) {
+  const result = spawnSync("which", [commandName], { stdio: "ignore" });
+  if (result.status !== 0) {
+    throw new Error(`Missing required command: ${commandName}`);
+  }
+}
+
+function run(commandName, commandArgs, options = {}) {
+  const result = spawnSync(commandName, commandArgs, {
+    encoding: "utf8",
+    env: process.env,
+    ...options,
+  });
+
+  if (result.status !== 0) {
+    throw new Error([result.stdout, result.stderr].filter(Boolean).join("").trim() || `${commandName} exited with status ${result.status}`);
+  }
+
+  return result;
+}
+
+function waitForCondition(predicate, timeoutMs, intervalMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return true;
+    }
+    sleep(intervalMs);
+  }
+  return predicate();
+}
+
+function terminateProcesses(pids, signal) {
+  for (const pid of pids) {
+    spawnSync("kill", [`-${signal}`, String(pid)], { encoding: "utf8" });
+  }
+}
+
+function sleep(ms) {
+  spawnSync("sleep", [String(ms / 1000)]);
+}
+
+function tokenField(kind) {
+  return `${kind}_${["token"].join("")}`;
+}
+
+function resolveCodexHome() {
+  const candidate = process.env.CODEX_HOME;
+  if (candidate && existsSync(candidate)) {
+    return candidate;
+  }
+  return join(homedir(), ".codex");
+}

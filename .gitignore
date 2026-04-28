@@ -1,0 +1,29 @@
+.DS_Store
+
+# Codex / ChatGPT auth material. These files are password-equivalent.
+auth.json
+accounts/
+*.auth.json
+registry.json
+registry*.json
+*.bak
+
+# Local runtime state
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+logs/
+log/
+tmp/
+.tmp/
+cache/
+sessions/
+
+# Node / Bun
+node_modules/
+bun.lockb
+
+# Editor noise
+.idea/
+.vscode/
+*.swp

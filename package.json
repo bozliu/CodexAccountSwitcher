@@ -1,0 +1,23 @@
+{
+  "name": "codex-account-switcher",
+  "version": "0.1.0",
+  "description": "A local Codex Mac App account switching helper built on top of codex-auth.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "codex-multi-auth": "bin/codex-multi-auth"
+  },
+  "scripts": {
+    "check": "bun bin/codex-multi-auth help"
+  },
+  "keywords": [
+    "codex",
+    "codex-auth",
+    "chatgpt",
+    "macos",
+    "cli"
+  ],
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
