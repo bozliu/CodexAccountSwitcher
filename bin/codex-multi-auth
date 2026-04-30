@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +21,10 @@ const TOKEN_KEYS = {
   refresh: tokenField("refresh"),
   id: tokenField("id"),
 };
+const OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
+const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
+const LOCK_STALE_MS = 2 * 60 * 1000;
 
 const args = process.argv.slice(2);
 const command = args[0] ?? "help";
@@ -55,6 +59,12 @@ async function main() {
     case "slots":
       await showSlots(args.slice(1));
       return;
+    case "refresh":
+      await refreshCommand(args.slice(1));
+      return;
+    case "doctor":
+      await doctorCommand(args.slice(1));
+      return;
     case "usage":
       showUsage();
       return;
@@ -82,6 +92,8 @@ Commands:
                                    Switch accounts, then restart the Codex app unless disabled.
   relaunch                         Fully quit and reopen the Codex app.
   slots [--cached]                 Show alias, active slot, remaining 5h/weekly quota, and email.
+  refresh <slot|--all>             Refresh expiring OAuth tokens and live usage without switching.
+  doctor auth                      Show token expiry and login-required state for each slot.
   usage                            Show codex-auth quota output for the stored accounts.
   status                           Show codex-auth status plus active slot and app state.
   auto on --local                  Enable codex-auth auto-switching with local-only usage refresh.
@@ -97,6 +109,7 @@ Recommended flow:
 
 Notes:
   - The Codex Mac App must be fully restarted after an account switch to pick up new auth.
+  - Non-cached slots output first rotates expired OAuth tokens, then refreshes usage.
   - Manual switch pauses auto-switch and does not silently re-enable it.
   - Stored auth snapshots are password-equivalent; keep ${accountsDir} local-only.
 `);
@@ -254,6 +267,79 @@ async function showSlots(slotArgs = []) {
     console.log("");
     console.log("Source: direct best-effort live refresh completed for this command.");
   }
+}
+
+async function refreshCommand(refreshArgs = []) {
+  const all = refreshArgs.includes("--all");
+  const query = refreshArgs.find((arg) => !arg.startsWith("--"));
+  if (!all && !query) {
+    throw new Error("refresh requires a slot/query or --all, for example: codex-multi-auth refresh slot-04");
+  }
+
+  const rawRegistry = readMutableRegistry();
+  const accounts = all ? [...rawRegistry.accounts].sort(compareAccounts) : [resolveAccountQuery(rawRegistry, query)];
+  const rows = [];
+  let failed = 0;
+
+  for (const account of accounts) {
+    const target = findMutableAccount(rawRegistry, account.account_key);
+    const tokenResult = await refreshAccountAuthIfNeeded(target);
+    applyAuthResult(target, tokenResult);
+
+    let usageLabel = "skipped";
+    let message = tokenResult.message ?? tokenResult.status;
+    if (tokenResult.status === "login_required" || (tokenResult.status === "network_retryable" && tokenResult.usable === false)) {
+      failed += 1;
+      usageLabel = "cached";
+    } else {
+      try {
+        const usageResult = await refreshUsageForAccount(target);
+        usageLabel = "updated";
+        message = [tokenResult.message, usageResult.message].filter(Boolean).join("; ") || tokenResult.status;
+      } catch (error) {
+        failed += 1;
+        usageLabel = "failed";
+        message = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    rows.push([target.alias ?? "", tokenResult.status, usageLabel, message]);
+  }
+
+  writeFileSync(registryPath, `${JSON.stringify(rawRegistry, null, 2)}\n`);
+  printTable(["ALIAS", "TOKEN", "USAGE", "MESSAGE"], rows);
+  if (failed > 0) {
+    console.log("");
+    console.log("Some slots still need attention. For login-required slots, run: codex-multi-auth login <slot>");
+  }
+}
+
+async function doctorCommand(doctorArgs = []) {
+  if (doctorArgs[0] !== "auth") {
+    throw new Error("doctor expects: codex-multi-auth doctor auth");
+  }
+
+  const registry = readRegistry();
+  const current = readCurrentAccount();
+  const rows = [...registry.accounts].sort(compareAccounts).map((account) => {
+    const snapshotPath = accountSnapshotPath(account.account_key);
+    const auth = existsSync(snapshotPath) ? readJsonFile(snapshotPath) : null;
+    const expiry = auth ? accessTokenExpiryMs(auth) : null;
+    const expiresAt = expiry ? new Date(expiry).toISOString().replace(".000Z", "Z") : "missing";
+    const state = account.login_required ? "login-required" : describeTokenState(expiry);
+    return [
+      account.alias ?? "",
+      current?.accountKey === account.account_key ? "yes" : "",
+      state,
+      expiresAt,
+      auth?.tokens?.[TOKEN_KEYS.refresh] ? "yes" : "no",
+      account.email ?? "?",
+    ];
+  });
+
+  printTable(["ALIAS", "ACTIVE", "ACCESS", "EXPIRES", "REFRESH", "EMAIL"], rows);
+  console.log("");
+  console.log("doctor auth is read-only. Expired slots with refresh=yes can normally be repaired by `codex-multi-auth refresh <slot>`.");
 }
 
 function showUsage() {
@@ -567,17 +653,28 @@ async function directLiveRefreshAccounts() {
 
   let updated = 0;
   let failed = 0;
+  let tokensRefreshed = 0;
   const failureReasons = [];
-  const now = Math.floor(Date.now() / 1000);
 
   for (const account of rawRegistry.accounts) {
     try {
-      const usage = fetchUsageSnapshot(accountSnapshotPath(account.account_key));
-      account.last_usage = usage;
-      account.last_usage_at = now;
-      if (typeof usage.plan_type === "string" && usage.plan_type.length > 0) {
-        account.plan = usage.plan_type;
+      const authResult = await refreshAccountAuthIfNeeded(account);
+      applyAuthResult(account, authResult);
+      if (authResult.status === "refreshed") {
+        tokensRefreshed += 1;
       }
+      if (authResult.status === "login_required") {
+        failed += 1;
+        failureReasons.push(`${account.alias ?? account.email ?? account.account_key}: ${authResult.message}`);
+        continue;
+      }
+      if (authResult.status === "network_retryable" && authResult.usable === false) {
+        failed += 1;
+        failureReasons.push(`${account.alias ?? account.email ?? account.account_key}: ${authResult.message}`);
+        continue;
+      }
+
+      await refreshUsageForAccount(account);
       updated += 1;
     } catch (error) {
       failed += 1;
@@ -590,49 +687,57 @@ async function directLiveRefreshAccounts() {
     mode: "direct-live",
     live: true,
     failed: failed > 0,
-    reason: failed > 0 ? `${updated} updated, ${failed} failed. ${failureReasons.slice(0, 3).join(" | ")}` : null,
+    reason: failed > 0
+      ? `${updated} updated, ${failed} failed, ${tokensRefreshed} token refreshed. ${failureReasons.join(" | ")}`
+      : `${updated} updated, ${tokensRefreshed} token refreshed.`,
   };
 }
 
-function fetchUsageSnapshot(snapshotPath) {
-  const probe = `
-import json, pathlib, sys, urllib.request, urllib.error
-path = pathlib.Path(sys.argv[1])
-auth = json.loads(path.read_text())
-token_key = "_".join(["access", "token"])
-token = auth.get("tokens", {}).get(token_key)
-if not token:
-    print(json.dumps({"ok": False, "error": "missing local account access token"}))
-    raise SystemExit(0)
-req = urllib.request.Request(
-    "https://chatgpt.com/backend-api/wham/usage",
-    headers={
-        "Authorization": " ".join(["Bear" + "er", token]),
-        "Accept": "application/json",
-        "User-Agent": "codex-multi-auth",
+async function refreshUsageForAccount(account) {
+  try {
+    const usage = await fetchUsageSnapshot(accountSnapshotPath(account.account_key));
+    applyUsage(account, usage);
+    return { status: "updated", message: "usage refreshed" };
+  } catch (error) {
+    if (!isUsageHttpError(error, 401)) {
+      throw error;
+    }
+
+    const retryRefresh = await refreshAccountAuthIfNeeded(account, { force: true });
+    applyAuthResult(account, retryRefresh);
+    if (retryRefresh.status === "login_required") {
+      throw new Error(`${retryRefresh.message}; run codex-multi-auth login ${account.alias ?? account.email ?? account.account_key}`);
+    }
+    if (retryRefresh.status === "network_retryable" && retryRefresh.usable === false) {
+      throw new Error(retryRefresh.message);
+    }
+
+    const usage = await fetchUsageSnapshot(accountSnapshotPath(account.account_key));
+    applyUsage(account, usage);
+    return { status: "updated", message: "usage refreshed after token rotation" };
+  }
+}
+
+async function fetchUsageSnapshot(snapshotPath) {
+  const auth = readJsonFile(snapshotPath);
+  const token = auth.tokens?.[TOKEN_KEYS.access];
+  if (!token) {
+    throw new Error("missing local account access token");
+  }
+
+  const response = await fetchWithTimeout("https://chatgpt.com/backend-api/wham/usage", {
+    headers: {
+      Authorization: `${["Bear", "er"].join("")} ${token}`,
+      Accept: "application/json",
+      "User-Agent": "codex-multi-auth",
     },
-)
-try:
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
-        print(json.dumps({"ok": True, "body": body}))
-except urllib.error.HTTPError as e:
-    print(json.dumps({"ok": False, "error": f"usage api returned {e.code}"}))
-except Exception as e:
-    print(json.dumps({"ok": False, "error": str(e)}))
-  `.trim();
+  });
 
-  const response = spawnSync("python3", ["-c", probe, snapshotPath], { encoding: "utf8" });
-  if (response.status !== 0) {
-    throw new Error(response.stderr?.trim() || `python3 exited with status ${response.status}`);
+  if (!response.ok) {
+    throw makeUsageHttpError(response.status, `usage api returned ${response.status}`);
   }
 
-  const parsed = JSON.parse(response.stdout ?? "{}");
-  if (!parsed.ok) {
-    throw new Error(parsed.error || "usage api probe failed");
-  }
-
-  const body = parsed.body;
+  const body = await response.json();
   const rateLimit = body?.rate_limit ?? {};
   const primary = rateLimit?.primary_window ?? {};
   const secondary = rateLimit?.secondary_window ?? {};
@@ -653,6 +758,235 @@ except Exception as e:
   };
 }
 
+async function refreshAccountAuthIfNeeded(account, options = {}) {
+  const snapshotPath = accountSnapshotPath(account.account_key);
+  if (!existsSync(snapshotPath)) {
+    return { status: "login_required", usable: false, message: "missing local auth snapshot; run codex-multi-auth login <slot>" };
+  }
+
+  let auth = readJsonFile(snapshotPath);
+  if (!options.force && !tokenNeedsRefresh(auth)) {
+    return { status: "fresh", usable: true, message: `access token fresh until ${formatExpiry(accessTokenExpiryMs(auth))}` };
+  }
+
+  const release = acquireAccountLock(account.account_key);
+  try {
+    auth = readJsonFile(snapshotPath);
+    if (!options.force && !tokenNeedsRefresh(auth)) {
+      return { status: "fresh", usable: true, message: `access token refreshed by another process until ${formatExpiry(accessTokenExpiryMs(auth))}` };
+    }
+
+    const refresh = auth.tokens?.[TOKEN_KEYS.refresh];
+    if (!refresh) {
+      return { status: "login_required", usable: tokenCurrentlyUsable(auth), message: "missing refresh token; run codex-multi-auth login <slot>" };
+    }
+
+    const oauthResult = await requestTokenRefresh(refresh);
+    if (!oauthResult.ok) {
+      return { ...oauthResult, usable: tokenCurrentlyUsable(auth) };
+    }
+
+    const updatedAuth = mergeRefreshedTokens(auth, oauthResult.body);
+    const identity = readAccountFromAuth(updatedAuth);
+    if (identity?.accountKey && identity.accountKey !== account.account_key) {
+      return {
+        status: "login_required",
+        usable: false,
+        message: `refreshed token belongs to a different account; run codex-multi-auth login ${account.alias ?? account.email ?? account.account_key}`,
+      };
+    }
+
+    writeFileSync(snapshotPath, `${JSON.stringify(updatedAuth, null, 2)}\n`);
+    syncActiveAuthIfNeeded(account.account_key, updatedAuth);
+    return {
+      status: "refreshed",
+      usable: true,
+      refreshedAt: updatedAuth.last_refresh,
+      message: `token refreshed until ${formatExpiry(accessTokenExpiryMs(updatedAuth))}`,
+    };
+  } finally {
+    release();
+  }
+}
+
+async function requestTokenRefresh(refreshToken) {
+  let response;
+  let text = "";
+  try {
+    response = await fetchWithTimeout(OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: OAUTH_CLIENT_ID,
+        grant_type: TOKEN_KEYS.refresh,
+        [TOKEN_KEYS.refresh]: refreshToken,
+      }),
+    });
+    text = await response.text();
+  } catch (error) {
+    return { ok: false, status: "network_retryable", message: `network_retryable: ${error instanceof Error ? error.message : String(error)}` };
+  }
+
+  const body = safeParseJson(text) ?? {};
+  if (!response.ok) {
+    const code = body.error ?? body.error_code ?? "oauth_error";
+    const permanent = isPermanentRefreshFailure(response.status, code, text);
+    return {
+      ok: false,
+      status: permanent ? "login_required" : "network_retryable",
+      message: permanent
+        ? `oauth refresh rejected (${response.status}, ${code}); run codex-multi-auth login <slot>`
+        : `network_retryable: oauth refresh returned ${response.status} (${code})`,
+    };
+  }
+
+  if (!body[TOKEN_KEYS.access]) {
+    return { ok: false, status: "network_retryable", message: "network_retryable: oauth refresh response did not include a new access token" };
+  }
+
+  return { ok: true, body };
+}
+
+function mergeRefreshedTokens(auth, body) {
+  const tokens = { ...(auth.tokens ?? {}) };
+  for (const key of [TOKEN_KEYS.access, TOKEN_KEYS.id, TOKEN_KEYS.refresh]) {
+    if (body[key]) {
+      tokens[key] = body[key];
+    }
+  }
+  return { ...auth, tokens, last_refresh: new Date().toISOString() };
+}
+
+function applyUsage(account, usage) {
+  account.last_usage = usage;
+  account.last_usage_at = Math.floor(Date.now() / 1000);
+  if (typeof usage.plan_type === "string" && usage.plan_type.length > 0) {
+    account.plan = usage.plan_type;
+  }
+}
+
+function applyAuthResult(account, result) {
+  account.auth_checked_at = Math.floor(Date.now() / 1000);
+  if (result.status === "login_required") {
+    account.login_required = true;
+    account.login_required_reason = result.message;
+    return;
+  }
+  delete account.login_required;
+  delete account.login_required_reason;
+  if (result.refreshedAt) {
+    account.last_auth_refresh_at = result.refreshedAt;
+  }
+}
+
+function tokenNeedsRefresh(auth) {
+  const expiry = accessTokenExpiryMs(auth);
+  return !expiry || expiry <= Date.now() + TOKEN_REFRESH_SKEW_MS;
+}
+
+function tokenCurrentlyUsable(auth) {
+  const expiry = accessTokenExpiryMs(auth);
+  return Boolean(expiry && expiry > Date.now());
+}
+
+function accessTokenExpiryMs(auth) {
+  const claims = decodeJwtPayload(auth?.tokens?.[TOKEN_KEYS.access]);
+  return typeof claims?.exp === "number" ? claims.exp * 1000 : null;
+}
+
+function describeTokenState(expiryMs) {
+  if (!expiryMs) return "missing";
+  if (expiryMs <= Date.now()) return "expired";
+  if (expiryMs <= Date.now() + TOKEN_REFRESH_SKEW_MS) return "refresh-soon";
+  return "fresh";
+}
+
+function formatExpiry(expiryMs) {
+  return expiryMs ? new Date(expiryMs).toISOString().replace(".000Z", "Z") : "unknown";
+}
+
+function syncActiveAuthIfNeeded(accountKey, updatedAuth) {
+  if (!existsSync(authPath)) {
+    return;
+  }
+  const active = readCurrentAccount();
+  if (active?.accountKey === accountKey) {
+    writeFileSync(authPath, `${JSON.stringify(updatedAuth, null, 2)}\n`);
+  }
+}
+
+function acquireAccountLock(accountKey) {
+  const lockPath = accountLockPath(accountKey);
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    try {
+      mkdirSync(lockPath);
+      writeFileSync(join(lockPath, "owner"), `${process.pid}\n${new Date().toISOString()}\n`);
+      return () => rmSync(lockPath, { recursive: true, force: true });
+    } catch (error) {
+      if (!existsSync(lockPath)) {
+        continue;
+      }
+      try {
+        const ageMs = Date.now() - statSync(lockPath).mtimeMs;
+        if (ageMs > LOCK_STALE_MS) {
+          rmSync(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        // Retry after a short pause if the lock disappeared while inspecting it.
+      }
+      sleep(250);
+    }
+  }
+  throw new Error(`Timed out waiting for refresh lock for ${accountKey}`);
+}
+
+function accountLockPath(accountKey) {
+  const encoded = Buffer.from(accountKey, "utf8").toString("base64url");
+  return join(accountsDir, `${encoded}.refresh.lock`);
+}
+
+async function fetchWithTimeout(url, options, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function makeUsageHttpError(status, message) {
+  const error = new Error(message);
+  error.code = "usage_http";
+  error.status = status;
+  return error;
+}
+
+function isUsageHttpError(error, status) {
+  return Boolean(error && error.code === "usage_http" && (status == null || error.status === status));
+}
+
+function safeParseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function isPermanentRefreshFailure(status, code, text) {
+  const haystack = `${code ?? ""}\n${text ?? ""}`;
+  return (
+    status === 401 ||
+    haystack.includes("invalid_grant") ||
+    haystack.includes(refreshErrorCode("expired")) ||
+    haystack.includes(refreshErrorCode("reused")) ||
+    haystack.includes(refreshErrorCode("invalidated"))
+  );
+}
+
 function accountSnapshotPath(accountKey) {
   const encoded = Buffer.from(accountKey, "utf8").toString("base64url");
   return join(accountsDir, `${encoded}.auth.json`);
@@ -663,7 +997,13 @@ function readCurrentAccount() {
     return null;
   }
 
-  const auth = readJsonFile(authPath);
+  return readAccountFromAuth(readJsonFile(authPath));
+}
+
+function readAccountFromAuth(auth) {
+  if (!auth) {
+    return null;
+  }
   const claims = decodeJwtPayload(auth.tokens?.[TOKEN_KEYS.id]);
   const authClaims = claims?.["https://api.openai.com/auth"] ?? {};
   const email = claims?.email ?? null;
@@ -701,6 +1041,26 @@ function readRegistry() {
 
   const registry = readJsonFile(registryPath);
   return { accounts: Array.isArray(registry.accounts) ? registry.accounts : [] };
+}
+
+function readMutableRegistry() {
+  if (!existsSync(registryPath)) {
+    return { accounts: [] };
+  }
+
+  const registry = readJsonFile(registryPath);
+  if (!Array.isArray(registry.accounts)) {
+    throw new Error("registry file is missing or malformed.");
+  }
+  return registry;
+}
+
+function findMutableAccount(registry, accountKey) {
+  const account = registry.accounts.find((candidate) => candidate.account_key === accountKey);
+  if (!account) {
+    throw new Error(`Could not find account ${accountKey}.`);
+  }
+  return account;
 }
 
 function getAutoSwitchStatus() {
@@ -938,6 +1298,10 @@ function sleep(ms) {
 
 function tokenField(kind) {
   return `${kind}_${["token"].join("")}`;
+}
+
+function refreshErrorCode(kind) {
+  return `${TOKEN_KEYS.refresh}_${kind}`;
 }
 
 function resolveCodexHome() {

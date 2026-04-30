@@ -10,6 +10,7 @@ It is designed for people who use the Codex Mac App as the main UI but want lowe
 - Switches the active `~/.codex/auth.json` through `codex-auth`.
 - Pauses `codex-auth` auto-switch before manual switches so manual selection stays sticky.
 - Fully restarts the Codex Mac App after switching and waits for the local app-server to stay connected.
+- Rotates expired or near-expired ChatGPT OAuth access tokens using the stored local refresh token.
 - Shows slot usage with a best-effort live refresh from the local account snapshots.
 
 ## What it does not do
@@ -69,6 +70,25 @@ List stored slots:
 codex-multi-auth slots
 ```
 
+`slots` first makes expiring OAuth tokens fresh, then refreshes usage. Use cached mode when you only want saved values and no network or file writes:
+
+```sh
+codex-multi-auth slots --cached
+```
+
+Refresh tokens and usage without switching accounts:
+
+```sh
+codex-multi-auth refresh --all
+codex-multi-auth refresh slot-04
+```
+
+Inspect token freshness without writing anything:
+
+```sh
+codex-multi-auth doctor auth
+```
+
 Switch to a slot:
 
 ```sh
@@ -97,12 +117,26 @@ Use this only if you understand the policy and stability risks of the upstream `
 
 ## Usage freshness
 
-By default, `codex-multi-auth slots` tries a direct, best-effort live usage refresh using the local account snapshots managed by `codex-auth`.
+By default, `codex-multi-auth slots` makes the local OAuth token usable before it tries direct usage refresh:
+
+- It decodes the access token expiry in each local snapshot.
+- It refreshes only when the token is expired or within five minutes of expiry.
+- It writes the rotated token back to that slot snapshot.
+- If the refreshed slot is the active account, it also updates `~/.codex/auth.json`.
+- It uses per-slot lock files so two processes do not consume the same rotating refresh token at the same time.
+
+This is designed to fix the common failure mode where usage refresh returns `401` because a stored access token expired.
 
 This is not an official public API contract. If refresh fails, the command falls back to cached registry data and reports that clearly. Use cached mode when you only want the saved snapshot:
 
 ```sh
 codex-multi-auth slots --cached
+```
+
+If the server rejects a refresh token as expired, reused, invalidated, or otherwise unauthorized, OAuth security rules still require a fresh login for that slot:
+
+```sh
+codex-multi-auth login slot-04
 ```
 
 ## Security
