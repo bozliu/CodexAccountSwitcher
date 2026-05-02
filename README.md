@@ -64,6 +64,22 @@ codex-multi-auth login slot-02
 codex-multi-auth login slot-03
 ```
 
+Replace an existing slot with a different account:
+
+```sh
+codex-auth remove slot-01
+codex-multi-auth login slot-01
+```
+
+If you already completed browser login and the command only failed because the alias was still owned by the old account, remove the old slot and capture the currently active auth instead of logging in again:
+
+```sh
+codex-auth remove slot-01
+codex-multi-auth capture slot-01
+```
+
+`codex-auth remove <slot>` deletes that stored account snapshot from the local account registry. Only run it when you no longer want that slot to point at the old account.
+
 List stored slots:
 
 ```sh
