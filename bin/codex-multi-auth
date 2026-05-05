@@ -59,6 +59,10 @@ async function main() {
     case "slots":
       await showSlots(args.slice(1));
       return;
+    case "resets":
+    case "reset":
+      await showResets(args.slice(1));
+      return;
     case "refresh":
       await refreshCommand(args.slice(1));
       return;
@@ -92,6 +96,7 @@ Commands:
                                    Switch accounts, then restart the Codex app unless disabled.
   relaunch                         Fully quit and reopen the Codex app.
   slots [--cached]                 Show alias, active slot, remaining 5h/weekly quota, and email.
+  resets [slot|--all] [--cached]   Show exact 5h and weekly reset times.
   refresh <slot|--all>             Refresh expiring OAuth tokens and live usage without switching.
   doctor auth                      Show token expiry and login-required state for each slot.
   usage                            Show codex-auth quota output for the stored accounts.
@@ -267,6 +272,43 @@ async function showSlots(slotArgs = []) {
     console.log("");
     console.log("Source: direct best-effort live refresh completed for this command.");
   }
+}
+
+async function showResets(resetArgs = []) {
+  const cachedOnly = resetArgs.includes("--cached");
+  const query = resetArgs.find((arg) => !arg.startsWith("--"));
+  if (!cachedOnly) {
+    await directLiveRefreshAccounts();
+  }
+
+  const registry = readRegistry();
+  const current = readCurrentAccount();
+  const accounts = query && query !== "--all"
+    ? [resolveAccountQuery(registry, query)]
+    : [...registry.accounts].sort(compareAccounts);
+
+  if (accounts.length === 0) {
+    console.log("No stored accounts yet.");
+    console.log("Run `codex-multi-auth setup slot-01` first.");
+    return;
+  }
+
+  const rows = accounts.map((account) => {
+    const usage = account.last_usage ?? {};
+    return [
+      account.alias ?? "",
+      current?.accountKey === account.account_key ? "yes" : "",
+      formatQuotaLeft(usage.primary?.used_percent),
+      formatResetAt(usage.primary?.resets_at),
+      formatQuotaLeft(usage.secondary?.used_percent),
+      formatResetAt(usage.secondary?.resets_at),
+      account.email ?? "?",
+    ];
+  });
+
+  printTable(["ALIAS", "ACTIVE", "5H LEFT", "5H RESET", "WEEK LEFT", "WEEK RESET", "EMAIL"], rows);
+  console.log("");
+  console.log(cachedOnly ? "Source: cached registry values only." : "Source: direct best-effort live refresh completed before showing reset times.");
 }
 
 async function refreshCommand(refreshArgs = []) {
@@ -1233,6 +1275,39 @@ function formatQuotaLeft(usedPercent) {
     return "pending";
   }
   return `${Math.max(0, 100 - usedPercent)}%`;
+}
+
+function formatResetAt(epochSeconds) {
+  if (typeof epochSeconds !== "number") {
+    return "pending";
+  }
+  const date = new Date(epochSeconds * 1000);
+  return `${formatDatePart(date)} ${formatTimePart(date)} ${formatTimezoneOffset(date)}`;
+}
+
+function formatDatePart(date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function formatTimePart(date) {
+  return [
+    String(date.getHours()).padStart(2, "0"),
+    String(date.getMinutes()).padStart(2, "0"),
+    String(date.getSeconds()).padStart(2, "0"),
+  ].join(":");
+}
+
+function formatTimezoneOffset(date) {
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absolute = Math.abs(offsetMinutes);
+  const hours = String(Math.floor(absolute / 60)).padStart(2, "0");
+  const minutes = String(absolute % 60).padStart(2, "0");
+  return `${sign}${hours}:${minutes}`;
 }
 
 function formatAge(epochSeconds) {

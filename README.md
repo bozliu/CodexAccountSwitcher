@@ -92,6 +92,16 @@ codex-multi-auth slots
 codex-multi-auth slots --cached
 ```
 
+Show exact reset times for the five-hour and weekly windows:
+
+```sh
+codex-multi-auth resets slot-02
+codex-multi-auth resets --all
+codex-multi-auth resets --cached
+```
+
+This prints `WEEK RESET` in your local timezone. When `WEEK LEFT` is `0%`, this is the server-reported time for that weekly usage window to reset.
+
 Refresh tokens and usage without switching accounts:
 
 ```sh
@@ -140,6 +150,7 @@ By default, `codex-multi-auth slots` makes the local OAuth token usable before i
 - It writes the rotated token back to that slot snapshot.
 - If the refreshed slot is the active account, it also updates `~/.codex/auth.json`.
 - It uses per-slot lock files so two processes do not consume the same rotating refresh token at the same time.
+- It stores server-provided `reset_at` values, which `codex-multi-auth resets` displays as local date/time.
 
 This is designed to fix the common failure mode where usage refresh returns `401` because a stored access token expired.
 
