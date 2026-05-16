@@ -64,6 +64,14 @@ codex-multi-auth login slot-02
 codex-multi-auth login slot-03
 ```
 
+Rename a stored slot without logging in again:
+
+```sh
+codex-multi-auth rename slot-08 slot-06
+```
+
+This only changes the local alias in `registry.json`; it does not modify the auth snapshot, token, or active login.
+
 Replace an existing slot with a different account:
 
 ```sh

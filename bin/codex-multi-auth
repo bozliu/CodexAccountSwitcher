@@ -50,6 +50,9 @@ async function main() {
     case "login":
       await login(args.slice(1));
       return;
+    case "rename":
+      renameCommand(args.slice(1));
+      return;
     case "switch":
       await switchCommand(args.slice(1));
       return;
@@ -92,6 +95,7 @@ Commands:
   setup [slot]                     Capture the current auth.json into a slot. Defaults to slot-01.
   capture <slot>                   Import the currently active ChatGPT auth into a slot alias.
   login <slot> [--device-auth]     Run Codex login, then capture the result into the slot.
+  rename <slot|query> <new-alias>  Rename a stored slot without logging in again.
   switch <slot|query> [--no-relaunch]
                                    Switch accounts, then restart the Codex app unless disabled.
   relaunch                         Fully quit and reopen the Codex app.
@@ -178,6 +182,40 @@ async function login(loginArgs) {
   const passthrough = loginArgs.includes("--device-auth") ? ["--device-auth"] : [];
   run("codex-auth", ["login", ...passthrough], { stdio: "inherit" });
   await capture(slot);
+}
+
+function renameCommand(renameArgs) {
+  const query = renameArgs[0];
+  const newAlias = renameArgs[1];
+  if (!query || !newAlias) {
+    throw new Error("rename requires an existing slot/query and a new alias, for example: codex-multi-auth rename slot-08 slot-06");
+  }
+  validateAlias(newAlias);
+
+  const rawRegistry = readMutableRegistry();
+  const target = resolveAccountQuery(rawRegistry, query);
+  const targetAccount = findMutableAccount(rawRegistry, target.account_key);
+  const existingOwner = rawRegistry.accounts.find((account) => account.alias === newAlias);
+  if (existingOwner && existingOwner.account_key !== target.account_key) {
+    throw new Error(`Alias ${newAlias} is already assigned to ${existingOwner.email ?? existingOwner.account_key}.`);
+  }
+
+  const oldAlias = targetAccount.alias ?? "(no-alias)";
+  if (oldAlias === newAlias) {
+    console.log(`Alias ${newAlias} already points to ${targetAccount.email ?? targetAccount.account_key}.`);
+    return;
+  }
+
+  targetAccount.alias = newAlias;
+  ensureUniqueAliases(rawRegistry);
+  writeFileSync(registryPath, `${JSON.stringify(rawRegistry, null, 2)}\n`);
+
+  console.log(`Renamed ${oldAlias} to ${newAlias}.`);
+  console.log(`Account: ${targetAccount.email ?? targetAccount.account_key}`);
+  const active = readCurrentAccount();
+  if (active?.accountKey === targetAccount.account_key) {
+    console.log(`This account is active; active slot now resolves to ${newAlias}.`);
+  }
 }
 
 async function switchCommand(switchArgs) {
@@ -1103,6 +1141,20 @@ function findMutableAccount(registry, accountKey) {
     throw new Error(`Could not find account ${accountKey}.`);
   }
   return account;
+}
+
+function ensureUniqueAliases(registry) {
+  const owners = new Map();
+  for (const account of registry.accounts) {
+    if (!account.alias) {
+      continue;
+    }
+    const owner = owners.get(account.alias);
+    if (owner && owner !== account.account_key) {
+      throw new Error(`Alias collision detected for ${account.alias}.`);
+    }
+    owners.set(account.alias, account.account_key);
+  }
 }
 
 function getAutoSwitchStatus() {
