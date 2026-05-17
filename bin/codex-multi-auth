@@ -909,7 +909,7 @@ async function requestTokenRefresh(refreshToken) {
 
   const body = safeParseJson(text) ?? {};
   if (!response.ok) {
-    const code = body.error ?? body.error_code ?? "oauth_error";
+    const code = extractOAuthErrorCode(body);
     const permanent = isPermanentRefreshFailure(response.status, code, text);
     return {
       ok: false,
@@ -1054,6 +1054,34 @@ function safeParseJson(text) {
   } catch {
     return null;
   }
+}
+
+function extractOAuthErrorCode(body) {
+  if (typeof body?.error === "string") {
+    return body.error;
+  }
+  if (typeof body?.error?.code === "string") {
+    return body.error.code;
+  }
+  if (typeof body?.error?.message === "string") {
+    const lowered = body.error.message.toLowerCase();
+    if (lowered.includes("invalidated")) {
+      return "token_invalidated";
+    }
+    if (lowered.includes("expired")) {
+      return refreshErrorCode("expired");
+    }
+    if (lowered.includes("reused")) {
+      return refreshErrorCode("reused");
+    }
+  }
+  if (typeof body?.error?.type === "string") {
+    return body.error.type;
+  }
+  if (typeof body?.error_code === "string") {
+    return body.error_code;
+  }
+  return "oauth_error";
 }
 
 function isPermanentRefreshFailure(status, code, text) {

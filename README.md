@@ -174,6 +174,12 @@ If the server rejects a refresh token as expired, reused, invalidated, or otherw
 codex-multi-auth login slot-04
 ```
 
+If a slot reports `token_invalidated`, the saved access token has also been invalidated by the server. This cannot be repaired locally or by token rotation; re-run login for that slot and select the same ChatGPT account in the browser:
+
+```sh
+codex-multi-auth login slot-06
+```
+
 ## Security
 
 Treat every file under `~/.codex/accounts/` as password-equivalent.
