@@ -158,6 +158,7 @@ async function capture(slot) {
   ensureAliasForAccount(slot, current.accountKey);
   run("codex-auth", ["switch", slot], { stdio: "pipe" });
   ensureAliasForAccount(slot, current.accountKey);
+  clearAccountAuthStatus(current.accountKey);
   await directLiveRefreshAccounts();
 
   const captured = findAccountByAlias(readRegistry(), slot);
@@ -737,6 +738,12 @@ async function directLiveRefreshAccounts() {
   const failureReasons = [];
 
   for (const account of rawRegistry.accounts) {
+    if (shouldSkipLoginRequiredAccount(account)) {
+      failed += 1;
+      failureReasons.push(`${account.alias ?? account.email ?? account.account_key}: login required (${account.login_required_reason ?? "auth token invalidated"}); run codex-multi-auth login ${account.alias ?? account.email ?? account.account_key}`);
+      continue;
+    }
+
     try {
       const authResult = await refreshAccountAuthIfNeeded(account);
       applyAuthResult(account, authResult);
@@ -758,6 +765,9 @@ async function directLiveRefreshAccounts() {
       updated += 1;
     } catch (error) {
       failed += 1;
+      if (isLoginRequiredError(error)) {
+        applyAuthResult(account, { status: "login_required", message: error.message });
+      }
       failureReasons.push(`${account.alias ?? account.email ?? account.account_key}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
@@ -774,8 +784,9 @@ async function directLiveRefreshAccounts() {
 }
 
 async function refreshUsageForAccount(account) {
+  const snapshotPath = accountSnapshotPath(account.account_key);
   try {
-    const usage = await fetchUsageSnapshot(accountSnapshotPath(account.account_key));
+    const usage = await fetchUsageSnapshot(snapshotPath);
     applyUsage(account, usage);
     return { status: "updated", message: "usage refreshed" };
   } catch (error) {
@@ -783,16 +794,21 @@ async function refreshUsageForAccount(account) {
       throw error;
     }
 
+    const auth = existsSync(snapshotPath) ? readJsonFile(snapshotPath) : null;
+    if (auth && !tokenNeedsRefresh(auth)) {
+      throw makeLoginRequiredError(`usage auth rejected (401, ${error.authCode ?? "token_invalidated"}); run codex-multi-auth login ${account.alias ?? account.email ?? account.account_key}`);
+    }
+
     const retryRefresh = await refreshAccountAuthIfNeeded(account, { force: true });
     applyAuthResult(account, retryRefresh);
     if (retryRefresh.status === "login_required") {
-      throw new Error(`${retryRefresh.message}; run codex-multi-auth login ${account.alias ?? account.email ?? account.account_key}`);
+      throw makeLoginRequiredError(`${retryRefresh.message}; run codex-multi-auth login ${account.alias ?? account.email ?? account.account_key}`);
     }
     if (retryRefresh.status === "network_retryable" && retryRefresh.usable === false) {
       throw new Error(retryRefresh.message);
     }
 
-    const usage = await fetchUsageSnapshot(accountSnapshotPath(account.account_key));
+    const usage = await fetchUsageSnapshot(snapshotPath);
     applyUsage(account, usage);
     return { status: "updated", message: "usage refreshed after token rotation" };
   }
@@ -813,11 +829,13 @@ async function fetchUsageSnapshot(snapshotPath) {
     },
   });
 
+  const text = await response.text();
+  const body = safeParseJson(text) ?? {};
   if (!response.ok) {
-    throw makeUsageHttpError(response.status, `usage api returned ${response.status}`);
+    const code = extractOAuthErrorCode(body);
+    throw makeUsageHttpError(response.status, `usage api returned ${response.status}${code ? ` (${code})` : ""}`, code);
   }
 
-  const body = await response.json();
   const rateLimit = body?.rate_limit ?? {};
   const primary = rateLimit?.primary_window ?? {};
   const secondary = rateLimit?.secondary_window ?? {};
@@ -1037,15 +1055,26 @@ async function fetchWithTimeout(url, options, timeoutMs = 20000) {
   }
 }
 
-function makeUsageHttpError(status, message) {
+function makeUsageHttpError(status, message, authCode = null) {
   const error = new Error(message);
   error.code = "usage_http";
   error.status = status;
+  error.authCode = authCode;
   return error;
 }
 
 function isUsageHttpError(error, status) {
   return Boolean(error && error.code === "usage_http" && (status == null || error.status === status));
+}
+
+function makeLoginRequiredError(message) {
+  const error = new Error(message);
+  error.code = "login_required";
+  return error;
+}
+
+function isLoginRequiredError(error) {
+  return Boolean(error && error.code === "login_required");
 }
 
 function safeParseJson(text) {
@@ -1169,6 +1198,30 @@ function findMutableAccount(registry, accountKey) {
     throw new Error(`Could not find account ${accountKey}.`);
   }
   return account;
+}
+
+function clearAccountAuthStatus(accountKey) {
+  const rawRegistry = readMutableRegistry();
+  const account = findMutableAccount(rawRegistry, accountKey);
+  delete account.login_required;
+  delete account.login_required_reason;
+  account.auth_checked_at = Math.floor(Date.now() / 1000);
+  writeFileSync(registryPath, `${JSON.stringify(rawRegistry, null, 2)}\n`);
+}
+
+function shouldSkipLoginRequiredAccount(account) {
+  if (!account.login_required) {
+    return false;
+  }
+  const checkedAtMs = typeof account.auth_checked_at === "number" ? account.auth_checked_at * 1000 : 0;
+  if (!checkedAtMs) {
+    return true;
+  }
+  try {
+    return statSync(accountSnapshotPath(account.account_key)).mtimeMs <= checkedAtMs;
+  } catch {
+    return true;
+  }
 }
 
 function ensureUniqueAliases(registry) {

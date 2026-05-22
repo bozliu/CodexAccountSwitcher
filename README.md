@@ -180,6 +180,12 @@ If a slot reports `token_invalidated`, the saved access token has also been inva
 codex-multi-auth login slot-06
 ```
 
+If a slot reports `refresh_token_reused`, the saved rotating refresh token has already been consumed or invalidated by the OAuth server. The CLI will mark that slot as login-required and skip further automatic refresh attempts until the slot is captured again:
+
+```sh
+codex-multi-auth login slot-06
+```
+
 ## Security
 
 Treat every file under `~/.codex/accounts/` as password-equivalent.
