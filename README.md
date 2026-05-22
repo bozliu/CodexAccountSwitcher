@@ -186,6 +186,34 @@ If a slot reports `refresh_token_reused`, the saved rotating refresh token has a
 codex-multi-auth login slot-06
 ```
 
+### Recovering several `refresh_token_reused` slots
+
+If `codex-multi-auth slots` reports several failures like this:
+
+```text
+slot-02: oauth refresh rejected (401, refresh_token_reused)
+slot-04: oauth refresh rejected (401, refresh_token_reused)
+slot-05: oauth refresh rejected (401, refresh_token_reused)
+slot-06: oauth refresh rejected (401, refresh_token_reused)
+```
+
+those slots cannot be repaired by another `refresh --all`. A rotating refresh token can be consumed only once; once the server rejects it as reused, the safe fix is to capture a fresh browser login for each affected slot:
+
+```sh
+codex-multi-auth doctor auth
+codex-multi-auth login slot-02
+codex-multi-auth login slot-04
+codex-multi-auth login slot-05
+codex-multi-auth login slot-06
+codex-multi-auth slots
+```
+
+After a successful login, `codex-multi-auth` clears the slot's `login_required` marker and writes the new token snapshot back to the existing alias, so you do not need to remove or recreate the slot.
+
+To avoid making this worse, do not repeatedly run `refresh --all` against slots already marked login-required. Current versions isolate those slots: `slots` and `refresh --all` keep cached values for them and print the exact `codex-multi-auth login <slot>` command instead of repeatedly consuming or retrying invalid OAuth state.
+
+This guard prevents the repeated-failure loop, but it cannot bypass OAuth security. If the server has already rejected a refresh token as reused, expired, or revoked, one fresh browser login for that slot is still required.
+
 ## Security
 
 Treat every file under `~/.codex/accounts/` as password-equivalent.
@@ -197,6 +225,7 @@ Do not commit, sync, paste, upload, or share:
 - `*.auth.json`
 - `registry.json`
 - backups of any of the above
+- local OAuth callback URLs containing `id_token`, such as `http://localhost:1455/success?...`
 
 This repository's `.gitignore` excludes those paths by default, but you should still run your own secret scan before publishing forks or patches.
 
